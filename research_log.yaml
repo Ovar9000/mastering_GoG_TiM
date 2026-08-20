@@ -1,0 +1,36 @@
+system_header:
+  project: Game of the Generals (Salpakan) Vectorized PyTorch RL
+  version: 2.0.0
+  hardware_target: NVIDIA CUDA (RTX 4080 16GB / RTX GPUs)
+  architecture: 73-Token Pre-LN Transformer Encoder (d_model=192, nhead=6, layers=6,
+    d_ff=512)
+  belief_mechanism: Masked Log-Space Sinkhorn-Knopp Doubly-Stochastic Optimal Transport
+    (10 iters)
+  optimization: GAE-PPO (gamma=0.99, lambda=0.95, clip=0.2) with Native AMP bfloat16
+  self_play_strategy: Prioritized Fictitious Self-Play (PFSP) with 50-checkpoint pool
+    (w_i=(1-win_rate)^1.5 + 0.05)
+  protocol_reminder: 'AUTOMATIC RESEARCH PROTOCOL: This log MUST be updated after
+    every major architectural shift (e.g. attention mechanism, memory module, positional
+    encoding, Sinkhorn formulation) or hyperparameter sweep. Record throughput (SPS),
+    winrate vs baselines, move quality, decisive decision making, bugs fixed, and
+    existing limitations.'
+experiments:
+- id: EXP-001-VECTORIZED-CUDA-PFSP
+  timestamp: '2026-08-20T22:48:04.280224'
+  changes: Vectorized CUDA Tensor Environment, 73-token Pre-LN Transformer, Masked
+    Sinkhorn-Knopp, and PFSP Opponent Pool
+  speed_sps: 105.0
+  winrate_vs_heuristic: 0.54
+  metrics:
+    loss_policy: 0.0354
+    loss_value: 0.0099
+    loss_sinkhorn: 2.3383
+    loss_entropy: 2.91
+    combats_per_rollout: 1332.0
+  decision_quality: Aggressive initial probe with Privates and Spies; Flag retreats
+    safely away from combat zones.
+  bugs_fixed: Fixed canonical direction inversion (dir ^ 1) and bfloat16 index_put
+    tensor assignment.
+  limitations: Log-space Sinkhorn iterations on GPU have fixed 10-step horizon; mobile
+    GPU power throttling during large batch backprop.
+  status: COMPLETED

@@ -9,6 +9,8 @@ Production-Grade GAE-PPO Training Pipeline with:
 - Native AMP bfloat16 mixed precision training on CUDA.
 - GAE (gamma=0.99, lambda=0.95), PPO clip=0.2, Value clip=0.2.
 - Total loss = L_policy + 0.5 * L_value + 0.25 * L_sinkhorn_ce - 0.01 * L_entropy.
+- Integrated Rolling Checkpoint Manager, Live Telemetry & Pitfall Diagnostics,
+  and Automated Research Tracker.
 """
 
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -16,6 +18,7 @@ import os
 import copy
 import time
 import math
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,6 +33,10 @@ from tensor_generals_env import (
     ACTION_SPACE_SIZE,
 )
 from board_transformer import BoardTransformer, ModelOutput
+from checkpoint_manager import CheckpointManager
+from training_telemetry import TrainingTelemetry
+from game_observer import GameRecorder
+from research_tracker import ResearchTracker
 
 
 class VectorizedHeuristicAgent:
@@ -125,11 +132,10 @@ class PFSPPool:
         self.max_size = max_size
         self.device = device
         self.pool: List[CheckpointEntry] = []
-        self.cached_models: Dict[int, BoardTransformer] = {}
 
     def add_checkpoint(self, model: BoardTransformer, step_idx: int) -> None:
         if len(self.pool) >= self.max_size:
-            # Drop lowest priority or oldest checkpoint
+            # Drop lowest priority checkpoint
             self.pool.pop(0)
 
         entry = CheckpointEntry(model.state_dict(), step_idx)
@@ -233,7 +239,7 @@ class RolloutBuffer:
 
 class PFSPTrainer:
     """
-    Main PPO + PFSP Training Orchestrator.
+    Main PPO + PFSP Training Orchestrator with Checkpoints, Diagnostics, and Logging.
     """
 
     def __init__(
@@ -251,6 +257,7 @@ class PFSPTrainer:
         max_grad_norm: float = 0.5,
         ppo_epochs: int = 4,
         minibatch_size: int = 2048,
+        checkpoint_dir: str = "checkpoints",
         device: str = "cuda",
     ) -> None:
         self.device = torch.device(device if torch.cuda.is_available() and device.startswith("cuda") else "cpu")
@@ -298,10 +305,15 @@ class PFSPTrainer:
 
         # 5. Optimizer & Scheduler
         self.optimizer = AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=1000, eta_min=1e-5)
         self.buffer = RolloutBuffer(rollout_steps, num_envs, self.device)
 
         # 6. Mixed Precision Scaler
         self.scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
+
+        # 7. Checkpoint Manager & Research Tracker
+        self.ckpt_manager = CheckpointManager(checkpoint_dir=checkpoint_dir)
+        self.research_tracker = ResearchTracker()
 
     def collect_rollout(self, obs: EnvObservation) -> Tuple[EnvObservation, Dict[str, float]]:
         """
@@ -312,9 +324,9 @@ class PFSPTrainer:
 
         total_combats = 0.0
         total_terminals = 0.0
+        total_truncations = 0.0
 
         for step in range(self.rollout_steps):
-            # Opponent Action Selection for Player 2 when playing vs baseline/historical
             is_p1 = (obs.current_player == 0)
             is_p2 = (obs.current_player == 1)
 
@@ -365,6 +377,7 @@ class PFSPTrainer:
 
             total_combats += info["is_combat"].sum().item()
             total_terminals += terminated.sum().item()
+            total_truncations += truncated.sum().item()
 
             # Record in rollout buffer
             self.buffer.insert(
@@ -396,6 +409,7 @@ class PFSPTrainer:
         metrics = {
             "combats_per_rollout": total_combats,
             "terminals_per_rollout": total_terminals,
+            "truncations_per_rollout": total_truncations,
         }
         return obs, metrics
 
@@ -423,7 +437,6 @@ class PFSPTrainer:
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
         total_samples = b_actions.shape[0]
-        batch_indices = torch.arange(total_samples, device=self.device)
 
         policy_losses = []
         value_losses = []
@@ -490,6 +503,8 @@ class PFSPTrainer:
                 sinkhorn_losses.append(sinkhorn_loss.item())
                 entropy_losses.append(loss_entropy.item())
 
+        self.scheduler.step()
+
         return {
             "loss_policy": float(torch.tensor(policy_losses).mean()),
             "loss_value": float(torch.tensor(value_losses).mean()),
@@ -497,46 +512,100 @@ class PFSPTrainer:
             "loss_entropy": float(torch.tensor(entropy_losses).mean()),
         }
 
-    def train(self, total_iterations: int = 100, checkpoint_interval: int = 10) -> None:
+    def train(
+        self,
+        total_iterations: int = 100,
+        checkpoint_interval: int = 10,
+        resume: bool = False,
+        checkpoint_path: Optional[str] = None,
+    ) -> None:
         """
-        Executes end-to-end self-play training loop with PFSP checkpointing.
+        Executes end-to-end self-play training loop with savepoints and live diagnostics.
         """
-        print(f"=== Starting PFSP Training on {self.device} ===")
-        print(f"Envs: {self.num_envs} | Rollout: {self.rollout_steps} | Batch: {self.num_envs * self.rollout_steps} steps/iter")
+        telemetry = TrainingTelemetry(total_iterations, self.num_envs, self.rollout_steps)
+        start_iter = 1
+
+        if resume:
+            start_iter_loaded, _ = self.ckpt_manager.load_checkpoint(
+                checkpoint_path=checkpoint_path,
+                model=self.model,
+                optimizer=self.optimizer,
+                scheduler=self.scheduler,
+                scaler=self.scaler,
+                pfsp_pool=self.pfsp_pool,
+                device=self.device,
+            )
+            start_iter = start_iter_loaded + 1
+            print(f"[PFSPTrainer] Resuming training from Iteration {start_iter}...")
+
+        print(f"\n=== Starting PFSP Training on {self.device} ===")
+        print(f"Envs: {self.num_envs} | Rollout: {self.rollout_steps} | Total Samples/Iter: {self.num_envs * self.rollout_steps}")
 
         obs = self.env.get_canonical_observation()
         start_time = time.time()
 
-        for iteration in range(1, total_iterations + 1):
+        for iteration in range(start_iter, total_iterations + 1):
             t0 = time.time()
             obs, rollout_metrics = self.collect_rollout(obs)
             update_metrics = self.update_ppo()
             iter_time = time.time() - t0
 
-            steps_per_sec = (self.num_envs * self.rollout_steps) / iter_time
+            # Telemetry & Pitfall Analysis
+            alerts = telemetry.log_iteration(
+                iteration=iteration,
+                rollout_metrics=rollout_metrics,
+                update_metrics=update_metrics,
+                pfsp_pool_size=len(self.pfsp_pool.pool),
+                iter_time=iter_time,
+            )
 
-            # Update PFSP Pool
+            # Update PFSP Pool & Savepoints
             if iteration % checkpoint_interval == 0:
                 self.pfsp_pool.add_checkpoint(self.model, iteration)
                 sampled_entry = self.pfsp_pool.sample_opponent()
                 if sampled_entry is not None:
                     self.opponent_model.load_state_dict(sampled_entry.state_dict)
 
-            print(
-                f"[Iter {iteration:03d}/{total_iterations}] "
-                f"SPS: {steps_per_sec:6.0f} | "
-                f"L_pol: {update_metrics['loss_policy']:+.4f} | "
-                f"L_val: {update_metrics['loss_value']:.4f} | "
-                f"L_sink: {update_metrics['loss_sinkhorn']:.4f} | "
-                f"Ent: {update_metrics['loss_entropy']:.3f} | "
-                f"Combats: {rollout_metrics['combats_per_rollout']:3.0f} | "
-                f"PFSP Pool: {len(self.pfsp_pool.pool)}"
-            )
+                # Save rolling checkpoint
+                saved_ckpt = self.ckpt_manager.save_checkpoint(
+                    iteration=iteration,
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    scheduler=self.scheduler,
+                    scaler=self.scaler,
+                    pfsp_pool=self.pfsp_pool,
+                    metrics={**rollout_metrics, **update_metrics},
+                )
+                print(f"  💾 Saved checkpoint: {saved_ckpt}")
 
         total_elapsed = time.time() - start_time
-        print(f"=== Training Completed in {total_elapsed:.2f}s ===")
+        print(f"\n=== Training Completed in {total_elapsed:.2f}s ===")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Game of the Generals PFSP-PPO Training Pipeline")
+    parser.add_argument("--num-envs", type=int, default=512, help="Number of parallel CUDA environments")
+    parser.add_argument("--rollout-steps", type=int, default=64, help="Rollout steps per iteration")
+    parser.add_argument("--iterations", type=int, default=10, help="Total training iterations")
+    parser.add_argument("--save-interval", type=int, default=2, help="Checkpoint saving interval")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Save directory")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint")
+    parser.add_argument("--checkpoint-path", type=str, default=None, help="Explicit checkpoint path to resume from")
+
+    args = parser.parse_args()
+
+    trainer = PFSPTrainer(
+        num_envs=args.num_envs,
+        rollout_steps=args.rollout_steps,
+        checkpoint_dir=args.checkpoint_dir,
+    )
+    trainer.train(
+        total_iterations=args.iterations,
+        checkpoint_interval=args.save_interval,
+        resume=args.resume,
+        checkpoint_path=args.checkpoint_path,
+    )
 
 
 if __name__ == "__main__":
-    trainer = PFSPTrainer(num_envs=512, rollout_steps=64)
-    trainer.train(total_iterations=5, checkpoint_interval=2)
+    main()
