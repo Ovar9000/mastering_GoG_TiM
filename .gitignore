@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Model checkpoints & runs
+checkpoints/
+models/
+*.pt
+*.pth
+*.ckpt
+wandb/
+runs/
+*.log
+
+# Caches & IDE
+.pytest_cache/
+.coverage
+htmlcov/
+.vscode/
+.idea/
