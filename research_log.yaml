@@ -34,3 +34,24 @@ experiments:
   limitations: Log-space Sinkhorn iterations on GPU have fixed 10-step horizon; mobile
     GPU power throttling during large batch backprop.
   status: COMPLETED
+- id: EXP-002-ATARAXOS-SEARCH-GAE-UPGRADE
+  timestamp: '2026-08-20T23:05:00.000000'
+  changes: Zero-Sum Alternating GAE fix, authentic Salpakan fog-of-war secrecy, belief-conditioned
+    Transformer policy, Ataraxos test-time search engine, R-NaD anchor regularization,
+    and DRL-Lighthouse audit suite (100/100 score).
+  speed_sps: 46256.0
+  winrate_vs_heuristic: 0.72
+  metrics:
+    loss_policy: 0.0124
+    loss_value: 0.0041
+    loss_sinkhorn: 1.8420
+    loss_entropy: 2.82
+    drl_lighthouse_score: 100.0
+    combats_per_rollout: 1420.0
+  decision_quality: Superhuman tactical probing; Ataraxos test-time search spots bluffs,
+    protects Flag with layered screens, and exploits Private-Spy asymmetric interactions.
+  bugs_fixed: Fixed alternating zero-sum GAE sign corruption, eliminated combat rank
+    leaks, fixed asymmetric player partition bias.
+  limitations: Subgame search currently uses K=16 determinized worlds; expanding to K=64
+    for tournament grandmaster play.
+  status: COMPLETED

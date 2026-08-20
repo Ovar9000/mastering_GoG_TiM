@@ -12,10 +12,17 @@ Live Training Telemetry, Dashboard, and RL Pitfall Diagnostics:
 """
 
 from typing import Dict, List, Optional, Tuple
+import sys
 import time
 import math
 import collections
 import torch
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 
 class PitfallAlert:
@@ -27,7 +34,7 @@ class PitfallAlert:
         self.recommendation = recommendation
 
     def __str__(self) -> str:
-        color_prefix = "⚠️ [WARNING]" if self.severity == "WARNING" else "🚨 [CRITICAL ALERT]"
+        color_prefix = "[WARNING]" if self.severity == "WARNING" else "[CRITICAL ALERT]"
         return f"{color_prefix} {self.name}: {self.message}\n   -> Recommendation: {self.recommendation}"
 
 

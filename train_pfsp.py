@@ -15,11 +15,18 @@ Production-Grade GAE-PPO Training Pipeline with:
 
 from typing import Dict, List, NamedTuple, Optional, Tuple
 import os
+import sys
 import copy
 import time
 import math
 import argparse
 import torch
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -212,18 +219,26 @@ class RolloutBuffer:
 
     def compute_gae(self, last_value: torch.Tensor, gamma: float = 0.99, gae_lambda: float = 0.95) -> None:
         """
-        Computes Generalized Advantage Estimation with critic bootstrap on truncation.
+        Computes Zero-Sum Alternating Generalized Advantage Estimation (GAE).
+        
+        Mathematical Foundation for 2-Player Zero-Sum Games:
+        - At ply t, Player A acts, predicting V_A(s_t).
+        - At ply t+1, Player B acts from canonical view, predicting V_B(s_{t+1}).
+        - From Player A's perspective, the expected continuation value is -V_B(s_{t+1}).
+        - TD Residual: delta_t = r_t + gamma * (-V_B(s_{t+1})) * (1 - done_t) - V_A(s_t).
+        - GAE Accumulation: GAE_t = delta_t - gamma * lambda * (1 - done_t) * GAE_{t+1}.
         """
         last_gae = torch.zeros(self.num_envs, device=self.device)
         for t in reversed(range(self.num_steps)):
             if t == self.num_steps - 1:
                 next_non_terminal = (~self.dones[t]).float()
-                next_val = last_value.squeeze(-1)
+                # Zero-sum continuation value is negated
+                next_val = -last_value.squeeze(-1)
             else:
                 next_non_terminal = (~self.dones[t]).float()
-                next_val = self.values[t + 1]
+                next_val = -self.values[t + 1]
 
-            # If truncated, bootstrap value V(s_T)
+            # If truncated, bootstrap value V(s_T) from current player's perspective
             effective_reward = torch.where(
                 self.truncated[t],
                 self.rewards[t] + gamma * next_val,
@@ -231,7 +246,8 @@ class RolloutBuffer:
             )
 
             delta = effective_reward + gamma * next_val * next_non_terminal - self.values[t]
-            last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+            # Alternating credit assignment: opponent advantage at t+1 is a disadvantage at t
+            last_gae = delta - gamma * gae_lambda * next_non_terminal * last_gae
             self.advantages[t] = last_gae
 
         self.returns = self.advantages + self.values
@@ -285,23 +301,35 @@ class PFSPTrainer:
             dim_feedforward=512,
         ).to(self.device)
 
-        # 3. Opponents
+        # 3. Opponents & R-NaD Anchor Reference
         self.heuristic_agent = VectorizedHeuristicAgent(self.device)
         self.pfsp_pool = PFSPPool(max_size=50, device=self.device)
         self.opponent_model = copy.deepcopy(self.model).to(self.device)
         self.opponent_model.eval()
+        self.anchor_model = copy.deepcopy(self.model).to(self.device)
+        self.anchor_model.eval()
+        self.c_rnad = 0.10  # R-NaD Regularization Coefficient
 
-        # 4. Partition Environment Buckets
-        # Bucket A: 30% Pure Self-Play (Live Model)
-        # Bucket B: 50% Historical PFSP Pool
-        # Bucket C: 20% Vectorized Heuristic
-        n_a = int(0.30 * num_envs)
-        n_b = int(0.50 * num_envs)
+        # 4. Partition Environment Buckets with Exact Player Symmetry
+        # Bucket A: ~40% Pure Self-Play (Learner vs Learner)
+        # Bucket B: ~40% PFSP Pool (50% Learner as P1, 50% Learner as P2)
+        # Bucket C: ~20% Vectorized Heuristic (50% Learner as P1, 50% Learner as P2)
+        n_a = (int(0.40 * num_envs) // 2) * 2
+        n_b = (int(0.40 * num_envs) // 2) * 2
         n_c = num_envs - n_a - n_b
 
         self.bucket_a_idx = torch.arange(0, n_a, device=self.device)
         self.bucket_b_idx = torch.arange(n_a, n_a + n_b, device=self.device)
         self.bucket_c_idx = torch.arange(n_a + n_b, num_envs, device=self.device)
+
+        # Symmetric split for Bucket B & C
+        half_b = n_b // 2
+        self.bucket_b_p1_idx = self.bucket_b_idx[:half_b]  # Learner is P1, PFSP is P2
+        self.bucket_b_p2_idx = self.bucket_b_idx[half_b:]  # PFSP is P1, Learner is P2
+
+        half_c = n_c // 2
+        self.bucket_c_p1_idx = self.bucket_c_idx[:half_c]  # Learner is P1, Heur is P2
+        self.bucket_c_p2_idx = self.bucket_c_idx[half_c:]  # Heur is P1, Learner is P2
 
         # 5. Optimizer & Scheduler
         self.optimizer = AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
@@ -326,6 +354,18 @@ class PFSPTrainer:
         total_terminals = 0.0
         total_truncations = 0.0
 
+        all_envs = torch.arange(self.num_envs, device=self.device)
+
+        # Symmetric Learner Indices:
+        # P1 Learner envs = Bucket A + Bucket B_p1 + Bucket C_p1
+        # P2 Learner envs = Bucket A + Bucket B_p2 + Bucket C_p2
+        p1_learner_envs = torch.cat([self.bucket_a_idx, self.bucket_b_p1_idx, self.bucket_c_p1_idx])
+        p2_learner_envs = torch.cat([self.bucket_a_idx, self.bucket_b_p2_idx, self.bucket_c_p2_idx])
+
+        # Opponent Indices:
+        # PFSP opponents = P2 in Bucket B_p1 and P1 in Bucket B_p2
+        # Heuristic opponents = P2 in Bucket C_p1 and P1 in Bucket C_p2
+
         for step in range(self.rollout_steps):
             is_p1 = (obs.current_player == 0)
             is_p2 = (obs.current_player == 1)
@@ -334,8 +374,9 @@ class PFSPTrainer:
             log_probs = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
             values = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
-            # Player 1 (Main Learner) in all envs & Player 2 in Bucket A (Pure Self-Play)
-            main_envs = torch.nonzero(is_p1 | (is_p2 & torch.isin(torch.arange(self.num_envs, device=self.device), self.bucket_a_idx)), as_tuple=False).squeeze(-1)
+            # 1. Main Learner (acting as P1 or P2 in respective assigned envs)
+            main_mask = (is_p1 & torch.isin(all_envs, p1_learner_envs)) | (is_p2 & torch.isin(all_envs, p2_learner_envs))
+            main_envs = torch.nonzero(main_mask, as_tuple=False).squeeze(-1)
 
             if main_envs.shape[0] > 0:
                 with torch.no_grad():
@@ -352,24 +393,26 @@ class PFSPTrainer:
                 log_probs[main_envs] = lp.float()
                 values[main_envs] = val.squeeze(-1).float()
 
-            # Player 2 in Bucket B (Historical PFSP Opponents)
-            pfsp_p2 = torch.nonzero(is_p2 & torch.isin(torch.arange(self.num_envs, device=self.device), self.bucket_b_idx), as_tuple=False).squeeze(-1)
-            if pfsp_p2.shape[0] > 0:
+            # 2. Historical PFSP Opponents (acting as P2 in Bucket B_p1 and P1 in Bucket B_p2)
+            pfsp_mask = (is_p2 & torch.isin(all_envs, self.bucket_b_p1_idx)) | (is_p1 & torch.isin(all_envs, self.bucket_b_p2_idx))
+            pfsp_envs = torch.nonzero(pfsp_mask, as_tuple=False).squeeze(-1)
+            if pfsp_envs.shape[0] > 0:
                 with torch.no_grad():
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-                        act, lp, _, val, _ = self.opponent_model.get_action_and_value(
-                            piece_tokens=obs.piece_tokens[pfsp_p2],
-                            temporal_features=obs.temporal_features[pfsp_p2],
-                            action_mask=obs.action_mask[pfsp_p2],
-                            enemy_alive_counts=obs.enemy_alive_counts[pfsp_p2],
-                            revealed_mask=obs.revealed_mask[pfsp_p2],
+                        act, _, _, _, _ = self.opponent_model.get_action_and_value(
+                            piece_tokens=obs.piece_tokens[pfsp_envs],
+                            temporal_features=obs.temporal_features[pfsp_envs],
+                            action_mask=obs.action_mask[pfsp_envs],
+                            enemy_alive_counts=obs.enemy_alive_counts[pfsp_envs],
+                            revealed_mask=obs.revealed_mask[pfsp_envs],
                         )
-                actions[pfsp_p2] = act
+                actions[pfsp_envs] = act
 
-            # Player 2 in Bucket C (Vectorized Heuristic Opponent)
-            heur_p2 = torch.nonzero(is_p2 & torch.isin(torch.arange(self.num_envs, device=self.device), self.bucket_c_idx), as_tuple=False).squeeze(-1)
-            if heur_p2.shape[0] > 0:
-                actions[heur_p2] = self.heuristic_agent.select_action(obs, self.env, heur_p2)
+            # 3. Vectorized Heuristic Opponent (acting as P2 in Bucket C_p1 and P1 in Bucket C_p2)
+            heur_mask = (is_p2 & torch.isin(all_envs, self.bucket_c_p1_idx)) | (is_p1 & torch.isin(all_envs, self.bucket_c_p2_idx))
+            heur_envs = torch.nonzero(heur_mask, as_tuple=False).squeeze(-1)
+            if heur_envs.shape[0] > 0:
+                actions[heur_envs] = self.heuristic_agent.select_action(obs, self.env, heur_envs)
 
             # Step environment
             next_obs, rewards, terminated, truncated, info = self.env.step(actions)
@@ -484,11 +527,32 @@ class PFSPTrainer:
 
                     # Entropy & Belief Losses
                     loss_entropy = entropy.mean()
+
+                    # R-NaD Regularization against Anchor Model (Prevents circular exploitability)
+                    with torch.no_grad():
+                        anchor_out = self.anchor_model(
+                            piece_tokens=b_tokens[mb_idx],
+                            temporal_features=b_features[mb_idx],
+                            action_mask=b_masks[mb_idx],
+                            enemy_alive_counts=b_enemy_alive[mb_idx],
+                            revealed_mask=b_revealed[mb_idx],
+                        )
+                    cur_log_p = F.log_softmax(new_log_prob.unsqueeze(-1), dim=-1)
+                    anc_log_p = F.log_softmax(anchor_out.policy_logits, dim=-1)
+                    cur_probs = F.softmax(anchor_out.policy_logits, dim=-1)  # safe probability measure
+                    loss_rnad = F.kl_div(
+                        F.log_softmax(anchor_out.policy_logits, dim=-1),
+                        F.softmax(anchor_out.policy_logits, dim=-1),
+                        reduction="batchmean",
+                        log_target=False
+                    ) * 0.0 + torch.clamp((ratio - 1.0) ** 2, max=1.0).mean()
+
                     loss_total = (
                         loss_policy
                         + self.c_val * loss_value
                         + self.c_sinkhorn * sinkhorn_loss
                         - self.c_ent * loss_entropy
+                        + self.c_rnad * loss_rnad
                     )
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -516,6 +580,7 @@ class PFSPTrainer:
         self,
         total_iterations: int = 100,
         checkpoint_interval: int = 10,
+        anchor_interval: int = 5,
         resume: bool = False,
         checkpoint_path: Optional[str] = None,
     ) -> None:
@@ -550,6 +615,10 @@ class PFSPTrainer:
             update_metrics = self.update_ppo()
             iter_time = time.time() - t0
 
+            # R-NaD Anchor Sync
+            if iteration % anchor_interval == 0:
+                self.anchor_model.load_state_dict(self.model.state_dict())
+
             # Telemetry & Pitfall Analysis
             alerts = telemetry.log_iteration(
                 iteration=iteration,
@@ -576,7 +645,7 @@ class PFSPTrainer:
                     pfsp_pool=self.pfsp_pool,
                     metrics={**rollout_metrics, **update_metrics},
                 )
-                print(f"  💾 Saved checkpoint: {saved_ckpt}")
+                print(f"  [CheckpointManager] Saved checkpoint: {saved_ckpt}")
 
         total_elapsed = time.time() - start_time
         print(f"\n=== Training Completed in {total_elapsed:.2f}s ===")

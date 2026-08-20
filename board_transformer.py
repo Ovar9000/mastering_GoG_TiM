@@ -114,19 +114,31 @@ class BoardTransformer(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(d_model)
 
-        # 3. Policy Head: Linear(192 -> 4) per square token
-        self.policy_head = nn.Linear(d_model, 4)
+        # 3. Belief Prior Head: Linear(192 -> 15) to produce cost matrix for Sinkhorn-Knopp
+        self.belief_head = nn.Linear(d_model, num_ranks)
+        self.belief_proj = nn.Linear(num_ranks, d_model)
 
-        # 4. Value Head: [CLS] -> MLP(192 -> 64 -> 1) -> Tanh()
+        # 4. Policy Head: Belief-Conditioned MLP(192 * 2 -> 192 -> 4) per square token
+        self.policy_head = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, 4)
+        )
+
+        # 5. Value Head: Belief-Conditioned MLP(192 * 2 -> 64 -> 1) -> Tanh()
         self.value_head = nn.Sequential(
-            nn.Linear(d_model, 64),
+            nn.Linear(d_model * 2, 64),
             nn.GELU(),
             nn.Linear(64, 1),
             nn.Tanh()
         )
 
-        # 5. Belief Head: Linear(192 -> 15) per square token
-        self.belief_head = nn.Linear(d_model, num_ranks)
+        # 6. Army Deployment Scoring Head: Linear(192 -> 1) per home square
+        self.deployment_head = nn.Sequential(
+            nn.Linear(d_model, 64),
+            nn.GELU(),
+            nn.Linear(64, 1)
+        )
 
         self.register_buffer("square_indices", torch.arange(num_squares, dtype=torch.int64))
 
@@ -248,19 +260,10 @@ class BoardTransformer(nn.Module):
             tokens = layer(tokens)
         tokens = self.final_norm(tokens)
 
-        # 4. Value Head: [CLS] token (index 0)
-        cls_out = tokens[:, 0]  # (B, d_model)
-        value = self.value_head(cls_out)  # (B, 1) in [-1, 1]
-
-        # 5. Policy Head: 72 board tokens (indices 1..72)
+        # 4. Masked Sinkhorn-Knopp Optimal Transport Belief Head
         board_tokens = tokens[:, 1:]  # (B, 72, d_model)
-        policy_raw = self.policy_head(board_tokens)  # (B, 72, 4)
-        policy_flat = policy_raw.view(B, -1)         # (B, 288)
+        cls_out = tokens[:, 0]        # (B, d_model)
 
-        # Action masking: set illegal actions to -1e4 (safe for bfloat16/float32)
-        policy_logits = torch.where(action_mask, policy_flat, torch.full_like(policy_flat, -1e4))
-
-        # 6. Masked Sinkhorn-Knopp Belief Head
         belief_raw = self.belief_head(board_tokens)  # (B, 72, 15)
         belief_probs, belief_log_probs, sinkhorn_loss = self._masked_sinkhorn_knopp(
             raw_logits=belief_raw,
@@ -269,6 +272,21 @@ class BoardTransformer(nn.Module):
             revealed_mask=revealed_mask,
             true_enemy_ranks=true_enemy_ranks,
         )
+
+        # 5. Project Doubly-Stochastic Beliefs & Fuse with Spatial Tokens
+        belief_embeds = self.belief_proj(belief_probs)  # (B, 72, d_model)
+        fused_board_tokens = torch.cat([board_tokens, belief_embeds], dim=-1)  # (B, 72, 2 * d_model)
+
+        # 6. Policy Head (Explicitly conditioned on spatial state + belief distribution)
+        policy_raw = self.policy_head(fused_board_tokens)  # (B, 72, 4)
+        policy_flat = policy_raw.view(B, -1)               # (B, 288)
+
+        # Action masking: set illegal actions to -1e4 (safe for bfloat16/float32)
+        policy_logits = torch.where(action_mask, policy_flat, torch.full_like(policy_flat, -1e4))
+
+        # 7. Value Head (Conditioned on [CLS] + global belief summary)
+        fused_cls = torch.cat([cls_out, belief_embeds.mean(dim=1)], dim=-1)  # (B, 2 * d_model)
+        value = self.value_head(fused_cls)  # (B, 1) in [-1, 1]
 
         return ModelOutput(
             policy_logits=policy_logits,

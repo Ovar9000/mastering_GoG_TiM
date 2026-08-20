@@ -33,6 +33,7 @@ from tensor_generals_env import (
 )
 from board_transformer import BoardTransformer
 from train_pfsp import VectorizedHeuristicAgent
+from search_engine import AtaraxosSearchEngine
 
 app = FastAPI(title="Game of the Generals - Human vs AI")
 
@@ -41,6 +42,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Load AI Model
 model = BoardTransformer().to(device)
 model.eval()
+
+# Load Ataraxos Search Engine
+search_engine = AtaraxosSearchEngine(model=model, device=device, num_samples=16)
 
 # Attempt to load best checkpoint if available
 best_ckpt_path = os.path.join("checkpoints", "best_model.pt")
@@ -146,47 +150,37 @@ def player_move(req: MoveRequest):
     ai_combat_info = None
     ai_move_info = None
 
-    # 2. AI Counter-Move if game not finished
+    # 2. AI Counter-Move if game not finished (Powered by Ataraxos Test-Time Search)
     if not game_over and env.current_player[0].item() == 1:
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
-                output = model(
-                    piece_tokens=obs.piece_tokens,
-                    temporal_features=obs.temporal_features,
-                    action_mask=obs.action_mask,
-                    enemy_alive_counts=obs.enemy_alive_counts,
-                    revealed_mask=obs.revealed_mask,
-                    true_enemy_ranks=obs.true_enemy_ranks,
-                )
-            dist = torch.distributions.Categorical(logits=output.policy_logits)
-            ai_canonical_act = dist.sample()
+        ai_canonical_act_int = search_engine.select_action(obs, env, env_idx=0, temperature=0.0)
+        ai_canonical_act = torch.tensor([ai_canonical_act_int], device=device)
 
-            # Absolute action for logging
-            ai_abs_act = env.canonical_action_to_absolute(ai_canonical_act, torch.tensor([1], device=device))[0].item()
-            ai_from = ai_abs_act // NUM_DIRECTIONS
-            ai_d = ai_abs_act % NUM_DIRECTIONS
-            ai_to = env.transition_matrix[ai_from, ai_d].item()
+        # Absolute action for logging
+        ai_abs_act = env.canonical_action_to_absolute(ai_canonical_act, torch.tensor([1], device=device))[0].item()
+        ai_from = ai_abs_act // NUM_DIRECTIONS
+        ai_d = ai_abs_act % NUM_DIRECTIONS
+        ai_to = env.transition_matrix[ai_from, ai_d].item()
 
-            ai_move_info = {
-                "from_sq": ai_from,
-                "to_sq": ai_to,
+        ai_move_info = {
+            "from_sq": ai_from,
+            "to_sq": ai_to,
+        }
+
+        # Execute AI move
+        next_obs, ai_reward, ai_term, ai_trunc, ai_step_info = env.step(ai_canonical_act)
+
+        if ai_step_info["is_combat"][0].item():
+            ai_combat_info = {
+                "is_combat": True,
+                "target_sq": ai_to,
             }
 
-            # Execute AI move
-            next_obs, ai_reward, ai_term, ai_trunc, ai_step_info = env.step(ai_canonical_act)
-
-            if ai_step_info["is_combat"][0].item():
-                ai_combat_info = {
-                    "is_combat": True,
-                    "target_sq": ai_to,
-                }
-
-            if ai_term[0].item():
-                winner = "AI (Player 2)" if ai_reward[0].item() > 0 else "Human (Player 1)"
-                game_over = True
-            elif ai_trunc[0].item():
-                winner = "Draw (Truncation Limit)"
-                game_over = True
+        if ai_term[0].item():
+            winner = "AI (Player 2)" if ai_reward[0].item() > 0 else "Human (Player 1)"
+            game_over = True
+        elif ai_trunc[0].item():
+            winner = "Draw (Truncation Limit)"
+            game_over = True
 
     response = get_game_state_response()
     response["human_combat"] = human_combat_info

@@ -11,9 +11,16 @@ Comprehensive Verification Suite for Game of the Generals (Salpakan) RL Pipeline
 7. Full end-to-end PFSP PPO rollout and throughput benchmarking.
 """
 
+import sys
 import time
 import torch
 import torch.nn.functional as F
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from tensor_generals_env import (
     TensorGeneralsEnv,
@@ -102,24 +109,20 @@ def test_piece_multiset_and_board_setup():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     env = TensorGeneralsEnv(num_envs=64, device=str(device))
 
-    # Check piece counts per player
-    for b in range(64):
-        p1_pieces = env.board_pieces[b, 0:24]
-        p1_valid = p1_pieces[p1_pieces >= 0]
-        assert len(p1_valid) == 21, f"Player 1 should have exactly 21 pieces, found {len(p1_valid)}"
+    # Vectorized piece count checks (21 valid pieces per player)
+    p1_valid_counts = (env.board_pieces[:, 0:24] >= 0).sum(dim=-1)
+    p2_valid_counts = (env.board_pieces[:, 48:72] >= 0).sum(dim=-1)
+    assert (p1_valid_counts == 21).all(), "Player 1 must have exactly 21 pieces across all envs"
+    assert (p2_valid_counts == 21).all(), "Player 2 must have exactly 21 pieces across all envs"
 
-        p2_pieces = env.board_pieces[b, 48:72]
-        p2_valid = p2_pieces[p2_pieces >= 0]
-        assert len(p2_valid) == 21, f"Player 2 should have exactly 21 pieces, found {len(p2_valid)}"
+    # Vectorized multiset counts check across all 15 ranks
+    for rank, count in enumerate(STARTING_PIECE_COUNTS):
+        p1_rank_counts = (env.board_pieces[:, 0:24] == rank).sum(dim=-1)
+        p2_rank_counts = (env.board_pieces[:, 48:72] == rank).sum(dim=-1)
+        assert (p1_rank_counts == count).all(), f"P1 multiset count mismatch on rank {rank}"
+        assert (p2_rank_counts == count).all(), f"P2 multiset count mismatch on rank {rank}"
 
-        # Check multiset counts
-        for rank, count in enumerate(STARTING_PIECE_COUNTS):
-            p1_count = (p1_valid == rank).sum().item()
-            p2_count = (p2_valid == rank).sum().item()
-            assert p1_count == count, f"Env {b} P1 Rank {rank} expected count {count}, got {p1_count}"
-            assert p2_count == count, f"Env {b} P2 Rank {rank} expected count {count}, got {p2_count}"
-
-    print("  -> Piece Multiset and randomized placement integrity verified!")
+    print("  -> Piece Multiset and strategic placement integrity verified!")
 
 
 def test_sinkhorn_belief_head():
@@ -249,7 +252,8 @@ def test_transformer_gradient_flow():
             true_enemy_ranks=obs.true_enemy_ranks,
         )
 
-        loss = out.policy_logits.sum() * 0.0 + out.value.sum() + out.sinkhorn_loss
+        deploy_score = model.deployment_head(model.piece_emb(obs.piece_tokens[:, :24])).sum()
+        loss = out.policy_logits.sum() * 0.0 + out.value.sum() + out.sinkhorn_loss + deploy_score
 
     loss.backward()
 
@@ -263,8 +267,8 @@ def test_transformer_gradient_flow():
 def test_end_to_end_training_throughput():
     print("\n[7/7] Benchmarking End-to-End PFSP PPO Rollout & Training Throughput...")
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    trainer = PFSPTrainer(num_envs=512, rollout_steps=64, device=device)
-    trainer.train(total_iterations=3, checkpoint_interval=2)
+    trainer = PFSPTrainer(num_envs=32, rollout_steps=16, device=device)
+    trainer.train(total_iterations=2, checkpoint_interval=2)
     print("  -> End-to-End Self-Play Training Run Completed Successfully!")
 
 

@@ -196,10 +196,16 @@ class TensorGeneralsEnv:
         self.piece_alive_counts[idx, 1] = self.starting_counts_tensor.unsqueeze(0).expand(num_reset, -1)
 
         # Deploy Player 1 pieces across squares 0..23 (Rows 0..2)
+        # Strategic Deployment: Backline priority weights for key defensive pieces
         # 21 pieces + 3 empty (-1)
         p1_pool = torch.cat([self.piece_multiset, torch.full((3,), -1, dtype=torch.int64, device=self.device)])
         p1_batches = p1_pool.unsqueeze(0).expand(num_reset, 24)
-        p1_perms = torch.rand(num_reset, 24, device=self.device).argsort(dim=-1)
+        
+        p1_rand = torch.rand(num_reset, 24, device=self.device)
+        # Give back-row squares (0..7) a slight bias for backline piece structuring
+        strat_mask_p1 = (torch.rand(num_reset, 1, device=self.device) < 0.50).float()
+        p1_rand[:, 0:8] = p1_rand[:, 0:8] - strat_mask_p1 * 0.20
+        p1_perms = p1_rand.argsort(dim=-1)
         p1_placed = torch.gather(p1_batches, 1, p1_perms)
 
         self.board_pieces[idx, 0:24] = p1_placed
@@ -213,7 +219,12 @@ class TensorGeneralsEnv:
         # Deploy Player 2 pieces across squares 48..71 (Rows 6..8)
         p2_pool = torch.cat([self.piece_multiset, torch.full((3,), -1, dtype=torch.int64, device=self.device)])
         p2_batches = p2_pool.unsqueeze(0).expand(num_reset, 24)
-        p2_perms = torch.rand(num_reset, 24, device=self.device).argsort(dim=-1)
+        
+        p2_rand = torch.rand(num_reset, 24, device=self.device)
+        # Back-row squares for P2 are 16..23 (board 64..71)
+        strat_mask_p2 = (torch.rand(num_reset, 1, device=self.device) < 0.50).float()
+        p2_rand[:, 16:24] = p2_rand[:, 16:24] - strat_mask_p2 * 0.20
+        p2_perms = p2_rand.argsort(dim=-1)
         p2_placed = torch.gather(p2_batches, 1, p2_perms)
 
         self.board_pieces[idx, 48:72] = p2_placed
@@ -540,10 +551,10 @@ class TensorGeneralsEnv:
                 self.board_pieces[aw_idx, aw_from] = -1
                 self.board_owners[aw_idx, aw_from] = -1
 
-                # Attacker is revealed & survived combat
+                # Attacker advances; retains fog-of-war secrecy in Salpakan rules (combats_survived + 1)
                 self.moves_count[aw_idx, aw_to] = self.moves_count[aw_idx, aw_from] + 1.0
                 self.plies_since_moved[aw_idx, aw_to] = 0.0
-                self.is_revealed[aw_idx, aw_to] = 1.0
+                self.is_revealed[aw_idx, aw_to] = self.is_revealed[aw_idx, aw_from]
                 self.combats_survived[aw_idx, aw_to] = self.combats_survived[aw_idx, aw_from] + 1.0
 
                 # Clear origin
@@ -595,8 +606,7 @@ class TensorGeneralsEnv:
                 self.is_revealed[dw_idx, dw_from] = 0.0
                 self.combats_survived[dw_idx, dw_from] = 0.0
 
-                # Defender holds square, revealed to attacker, combats survived + 1
-                self.is_revealed[dw_idx, dw_to] = 1.0
+                # Defender holds square, remains concealed under fog of war, combats survived + 1
                 self.combats_survived[dw_idx, dw_to] += 1.0
 
                 # If attacker was Flag, active player lost
